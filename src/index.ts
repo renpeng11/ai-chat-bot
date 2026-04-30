@@ -10,6 +10,7 @@ export interface Env {
   FEISHU_BOT_WEBHOOK?: string;
   ZHIPU_API_KEY: string;
   ZHIPU_MODEL?: string;
+  AUTO_REPLY_ENABLED?: string;
   TZ?: string;
 }
 
@@ -46,7 +47,7 @@ const HTML_HEADERS = {
 const SESSION_COOKIE = "fd_session";
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     try {
@@ -59,7 +60,7 @@ export default {
       }
 
       if (url.pathname === "/feishu/webhook" && request.method === "POST") {
-        return handleFeishuWebhook(request, env);
+        return handleFeishuWebhook(request, env, ctx);
       }
 
       if (url.pathname === "/admin" && request.method === "GET") {
@@ -99,7 +100,7 @@ export default {
   },
 };
 
-async function handleFeishuWebhook(request: Request, env: Env): Promise<Response> {
+async function handleFeishuWebhook(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const payload = await request.json<unknown>();
   const body = payload as Record<string, unknown>;
 
@@ -130,6 +131,10 @@ async function handleFeishuWebhook(request: Request, env: Env): Promise<Response
       JSON.stringify(body),
     )
     .run();
+
+  if (shouldAutoReply(env, inbound)) {
+    ctx.waitUntil(autoReplyToInboundMessage(env, inbound));
+  }
 
   return json({ ok: true });
 }
@@ -293,7 +298,12 @@ async function sendSummaryToFeishu(env: Env, summary: SummaryRecord): Promise<{ 
 
 async function sendFeishuText(env: Env, text: string): Promise<{ ok: boolean; error?: string }> {
   if (env.FEISHU_APP_ID && env.FEISHU_APP_SECRET && env.FEISHU_TARGET_RECEIVE_ID) {
-    return sendFeishuAppText(env, text);
+    return sendFeishuAppText(
+      env,
+      text,
+      env.FEISHU_TARGET_RECEIVE_ID,
+      env.FEISHU_TARGET_RECEIVE_ID_TYPE || "chat_id",
+    );
   }
 
   if (!env.FEISHU_BOT_WEBHOOK) {
@@ -331,9 +341,13 @@ async function sendFeishuText(env: Env, text: string): Promise<{ ok: boolean; er
   return { ok: true };
 }
 
-async function sendFeishuAppText(env: Env, text: string): Promise<{ ok: boolean; error?: string }> {
+async function sendFeishuAppText(
+  env: Env,
+  text: string,
+  receiveId: string,
+  receiveIdType = "chat_id",
+): Promise<{ ok: boolean; error?: string }> {
   const token = await getFeishuTenantAccessToken(env);
-  const receiveIdType = env.FEISHU_TARGET_RECEIVE_ID_TYPE || "chat_id";
   const response = await fetch(
     `https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=${encodeURIComponent(receiveIdType)}`,
     {
@@ -343,7 +357,7 @@ async function sendFeishuAppText(env: Env, text: string): Promise<{ ok: boolean;
         authorization: `Bearer ${token}`,
       },
       body: JSON.stringify({
-        receive_id: env.FEISHU_TARGET_RECEIVE_ID,
+        receive_id: receiveId,
         msg_type: "text",
         content: JSON.stringify({ text }),
       }),
@@ -360,6 +374,66 @@ async function sendFeishuAppText(env: Env, text: string): Promise<{ ok: boolean;
     return { ok: false, error: data.msg ?? responseText };
   }
   return { ok: true };
+}
+
+async function autoReplyToInboundMessage(env: Env, inbound: FeishuInbound): Promise<void> {
+  if (!inbound.chatId) return;
+
+  try {
+    const reply = await generateAutoReply(env, inbound);
+    const result = await sendFeishuAppText(env, reply, inbound.chatId, "chat_id");
+    await recordOutgoing(env, null, reply, result.ok ? "sent" : "failed", result.error);
+  } catch (error) {
+    const errorText = errorMessage(error);
+    await recordOutgoing(env, null, `自动回复失败：${inbound.content}`, "failed", errorText);
+    console.error("auto reply failed", error);
+  }
+}
+
+async function generateAutoReply(env: Env, inbound: FeishuInbound): Promise<string> {
+  if (!env.ZHIPU_API_KEY) {
+    throw new Error("ZHIPU_API_KEY is not configured");
+  }
+
+  const response = await fetch("https://open.bigmodel.cn/api/paas/v4/chat/completions", {
+    method: "POST",
+    headers: {
+      ...JSON_HEADERS,
+      authorization: `Bearer ${env.ZHIPU_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: env.ZHIPU_MODEL ?? "glm-4-flash",
+      messages: [
+        {
+          role: "system",
+          content:
+            "你是飞书里的个人 AI 助手。请直接回复用户消息，中文为主，简洁、友好、可执行。不要声称你无法读取上下文之外的信息。",
+        },
+        {
+          role: "user",
+          content: [
+            `发送者：${inbound.senderName || inbound.senderId || "未知"}`,
+            `消息类型：${inbound.messageType}`,
+            "消息内容：",
+            inbound.content,
+          ].join("\n"),
+        },
+      ],
+      temperature: 0.6,
+    }),
+  });
+
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(`Zhipu auto reply HTTP ${response.status}: ${raw}`);
+  }
+
+  const data = JSON.parse(raw) as { choices?: Array<{ message?: { content?: string } }> };
+  const content = data.choices?.[0]?.message?.content?.trim();
+  if (!content) {
+    throw new Error("Zhipu response did not include auto reply content");
+  }
+  return content;
 }
 
 async function getFeishuTenantAccessToken(env: Env): Promise<string> {
@@ -529,6 +603,14 @@ function validateFeishuToken(body: Record<string, unknown>, env: Env): void {
   if (token !== env.FEISHU_VERIFICATION_TOKEN) {
     throw new Error("Invalid Feishu verification token");
   }
+}
+
+function shouldAutoReply(env: Env, inbound: FeishuInbound): boolean {
+  if ((env.AUTO_REPLY_ENABLED ?? "true").toLowerCase() === "false") return false;
+  if (!env.FEISHU_APP_ID || !env.FEISHU_APP_SECRET) return false;
+  if (!inbound.chatId) return false;
+  if (!inbound.content.trim()) return false;
+  return true;
 }
 
 async function handleLogin(request: Request, env: Env): Promise<Response> {

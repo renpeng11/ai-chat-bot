@@ -21,5 +21,7 @@ TZ = "Asia/Shanghai"
 FEISHU_VERIFICATION_TOKEN = ""
 # Optional: pick the Zhipu model you enabled for your account.
 ZHIPU_MODEL = "glm-4-flash"
+# Set to "false" if you only want to record messages and generate daily summaries.
+AUTO_REPLY_ENABLED = "true"
 # Feishu message API receive_id_type. Common values: chat_id, open_id, user_id, union_id, email.
 FEISHU_TARGET_RECEIVE_ID_TYPE = "chat_id"
