@@ -1,0 +1,25 @@
+name = "feishu-ai-digest"
+main = "src/index.ts"
+compatibility_date = "2026-04-30"
+routes = [
+  { pattern = "meizhen.ccwu.cc", custom_domain = true }
+]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "feishu_ai_digest"
+database_id = "f7f3ff23-13af-410b-8059-2edba363ef5e"
+
+[triggers]
+# Cloudflare Cron uses UTC. 10:00 UTC is 18:00 in Asia/Shanghai.
+crons = ["0 10 * * *"]
+
+[vars]
+ADMIN_USERNAME = "admin"
+TZ = "Asia/Shanghai"
+# Optional: used to validate Feishu event callback payloads when present.
+FEISHU_VERIFICATION_TOKEN = ""
+# Optional: pick the Zhipu model you enabled for your account.
+ZHIPU_MODEL = "glm-4-flash"
+# Feishu message API receive_id_type. Common values: chat_id, open_id, user_id, union_id, email.
+FEISHU_TARGET_RECEIVE_ID_TYPE = "chat_id"
