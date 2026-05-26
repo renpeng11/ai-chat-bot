@@ -43,3 +43,17 @@ CREATE TABLE IF NOT EXISTS outgoing_messages (
 
 CREATE INDEX IF NOT EXISTS idx_outgoing_messages_created_at
   ON outgoing_messages(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS ai_models (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT 'openai_compatible',
+  base_url TEXT NOT NULL,
+  api_key TEXT NOT NULL,
+  model TEXT NOT NULL,
+  is_active INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_models_active
+  ON ai_models(is_active) WHERE is_active = 1;

@@ -45,6 +45,17 @@ type SummaryRecord = {
   created_at: string;
 };
 
+type AiModel = {
+  id: number;
+  name: string;
+  provider: string;
+  base_url: string;
+  api_key: string;
+  model: string;
+  is_active: number;
+  created_at: string;
+};
+
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
 };
@@ -54,6 +65,75 @@ const HTML_HEADERS = {
 };
 
 const SESSION_COOKIE = "fd_session";
+
+async function getActiveModel(env: Env): Promise<AiModel | null> {
+  const row = await env.DB.prepare(
+    `SELECT id, name, provider, base_url, api_key, model, is_active, created_at
+     FROM ai_models
+     WHERE is_active = 1
+     LIMIT 1`,
+  ).first<AiModel>();
+  return row ?? null;
+}
+
+async function callAI(
+  env: Env,
+  modelConfig: { base_url: string; api_key: string; model: string },
+  messages: Array<{ role: string; content: string }>,
+  temperature = 0.3,
+): Promise<{ content: string; raw: string }> {
+  const url = modelConfig.base_url.replace(/\/+$/, "") + "/chat/completions";
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      ...JSON_HEADERS,
+      authorization: `Bearer ${modelConfig.api_key}`,
+    },
+    body: JSON.stringify({
+      model: modelConfig.model,
+      messages,
+      temperature,
+    }),
+  });
+
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(`AI API HTTP ${response.status}: ${raw}`);
+  }
+
+  const data = JSON.parse(raw) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const content = data.choices?.[0]?.message?.content?.trim();
+  if (!content) {
+    throw new Error("AI response did not include content");
+  }
+  return { content, raw };
+}
+
+async function getModelConfig(
+  env: Env,
+): Promise<{ base_url: string; api_key: string; model: string }> {
+  const activeModel = await getActiveModel(env);
+  if (activeModel) {
+    return {
+      base_url: activeModel.base_url,
+      api_key: activeModel.api_key,
+      model: activeModel.model,
+    };
+  }
+  if (env.ZHIPU_API_KEY) {
+    return {
+      base_url: "https://open.bigmodel.cn/api/paas/v4",
+      api_key: env.ZHIPU_API_KEY,
+      model: env.ZHIPU_MODEL ?? "glm-4-flash",
+    };
+  }
+  throw new Error(
+    "未配置 AI 模型，请在「AI 模型配置」中添加并激活一个模型，或在环境变量中设置 ZHIPU_API_KEY",
+  );
+}
 
 export default {
   async fetch(
@@ -203,9 +283,13 @@ async function handleApi(
   }
 
   if (url.pathname === "/api/summaries/run" && request.method === "POST") {
-    if (!env.ZHIPU_API_KEY) {
+    const activeModel = await getActiveModel(env);
+    if (!activeModel && !env.ZHIPU_API_KEY) {
       return json(
-        { error: "ZHIPU_API_KEY 未配置，请在 Cloudflare Workers 中设置该变量" },
+        {
+          error:
+            "未配置 AI 模型，请在「AI 模型配置」中添加并激活一个模型，或在环境变量中设置 ZHIPU_API_KEY",
+        },
         500,
       );
     }
@@ -279,6 +363,138 @@ async function handleApi(
         ? JSON.stringify(searchResult.response).slice(0, 1000)
         : null,
     });
+  }
+
+  if (url.pathname === "/api/models" && request.method === "GET") {
+    const rows = await env.DB.prepare(
+      `SELECT id, name, provider, base_url, api_key, model, is_active, created_at
+       FROM ai_models
+       ORDER BY created_at DESC`,
+    ).all();
+    return json({ models: rows.results });
+  }
+
+  if (url.pathname === "/api/models" && request.method === "POST") {
+    const body = await request.json<{
+      name?: string;
+      provider?: string;
+      base_url?: string;
+      api_key?: string;
+      model?: string;
+    }>();
+    const name = (body.name ?? "").trim();
+    const base_url = (body.base_url ?? "").trim();
+    const api_key = (body.api_key ?? "").trim();
+    const model = (body.model ?? "").trim();
+    if (!name || !base_url || !api_key || !model) {
+      return json({ error: "name, base_url, api_key, model 都是必填项" }, 400);
+    }
+
+    const insert = await env.DB.prepare(
+      `INSERT INTO ai_models (name, provider, base_url, api_key, model, is_active)
+       VALUES (?, ?, ?, ?, ?, 0)`,
+    )
+      .bind(
+        name,
+        body.provider ?? "openai_compatible",
+        base_url,
+        api_key,
+        model,
+      )
+      .run();
+
+    const id = Number(insert.meta.last_row_id);
+    const created = await env.DB.prepare(
+      `SELECT id, name, provider, base_url, api_key, model, is_active, created_at
+       FROM ai_models WHERE id = ?`,
+    )
+      .bind(id)
+      .first<AiModel>();
+    return json({ model: created }, 201);
+  }
+
+  const modelUpdateMatch = url.pathname.match(/^\/api\/models\/(\d+)$/);
+  if (modelUpdateMatch && request.method === "PUT") {
+    const body = await request.json<{
+      name?: string;
+      provider?: string;
+      base_url?: string;
+      api_key?: string;
+      model?: string;
+    }>();
+    const existing = await env.DB.prepare(
+      `SELECT id FROM ai_models WHERE id = ?`,
+    )
+      .bind(Number(modelUpdateMatch[1]))
+      .first();
+    if (!existing) return json({ error: "Model not found" }, 404);
+
+    await env.DB.prepare(
+      `UPDATE ai_models
+       SET name = COALESCE(?, name),
+           provider = COALESCE(?, provider),
+           base_url = COALESCE(?, base_url),
+           api_key = COALESCE(?, api_key),
+           model = COALESCE(?, model)
+       WHERE id = ?`,
+    )
+      .bind(
+        body.name?.trim() ?? null,
+        body.provider ?? null,
+        body.base_url?.trim() ?? null,
+        body.api_key?.trim() ?? null,
+        body.model?.trim() ?? null,
+        Number(modelUpdateMatch[1]),
+      )
+      .run();
+
+    const updated = await env.DB.prepare(
+      `SELECT id, name, provider, base_url, api_key, model, is_active, created_at
+       FROM ai_models WHERE id = ?`,
+    )
+      .bind(Number(modelUpdateMatch[1]))
+      .first<AiModel>();
+    return json({ model: updated });
+  }
+
+  if (modelUpdateMatch && request.method === "DELETE") {
+    const existing = await env.DB.prepare(
+      `SELECT id FROM ai_models WHERE id = ?`,
+    )
+      .bind(Number(modelUpdateMatch[1]))
+      .first();
+    if (!existing) return json({ error: "Model not found" }, 404);
+
+    await env.DB.prepare(`DELETE FROM ai_models WHERE id = ?`)
+      .bind(Number(modelUpdateMatch[1]))
+      .run();
+    return json({ ok: true });
+  }
+
+  const modelActivateMatch = url.pathname.match(
+    /^\/api\/models\/(\d+)\/activate$/,
+  );
+  if (modelActivateMatch && request.method === "POST") {
+    const targetId = Number(modelActivateMatch[1]);
+    const existing = await env.DB.prepare(
+      `SELECT id FROM ai_models WHERE id = ?`,
+    )
+      .bind(targetId)
+      .first();
+    if (!existing) return json({ error: "Model not found" }, 404);
+
+    await env.DB.prepare(`UPDATE ai_models SET is_active = 0`).run();
+    await env.DB.prepare(`UPDATE ai_models SET is_active = 1 WHERE id = ?`)
+      .bind(targetId)
+      .run();
+
+    const activated = await env.DB.prepare(
+      `SELECT id, name, provider, base_url, api_key, model, is_active, created_at
+       FROM ai_models WHERE id = ?`,
+    )
+      .bind(targetId)
+      .first<AiModel>();
+    return json({ model: activated });
   }
 
   return json({ error: "Not found" }, 404);
@@ -563,54 +779,29 @@ async function generateAutoReply(
   env: Env,
   inbound: FeishuInbound,
 ): Promise<string> {
-  if (!env.ZHIPU_API_KEY) {
-    throw new Error("ZHIPU_API_KEY is not configured");
-  }
-
-  const response = await fetch(
-    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        ...JSON_HEADERS,
-        authorization: `Bearer ${env.ZHIPU_API_KEY}`,
+  const config = await getModelConfig(env);
+  const result = await callAI(
+    env,
+    config,
+    [
+      {
+        role: "system",
+        content:
+          "你是飞书里的个人 AI 助手。请直接回复用户消息，中文为主，简洁、友好、可执行。不要声称你无法读取上下文之外的信息。",
       },
-      body: JSON.stringify({
-        model: env.ZHIPU_MODEL ?? "glm-4-flash",
-        messages: [
-          {
-            role: "system",
-            content:
-              "你是飞书里的个人 AI 助手。请直接回复用户消息，中文为主，简洁、友好、可执行。不要声称你无法读取上下文之外的信息。",
-          },
-          {
-            role: "user",
-            content: [
-              `发送者：${inbound.senderName || inbound.senderId || "未知"}`,
-              `消息类型：${inbound.messageType}`,
-              "消息内容：",
-              inbound.content,
-            ].join("\n"),
-          },
-        ],
-        temperature: 0.6,
-      }),
-    },
+      {
+        role: "user",
+        content: [
+          `发送者：${inbound.senderName || inbound.senderId || "未知"}`,
+          `消息类型：${inbound.messageType}`,
+          "消息内容：",
+          inbound.content,
+        ].join("\n"),
+      },
+    ],
+    0.6,
   );
-
-  const raw = await response.text();
-  if (!response.ok) {
-    throw new Error(`Zhipu auto reply HTTP ${response.status}: ${raw}`);
-  }
-
-  const data = JSON.parse(raw) as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
-  const content = data.choices?.[0]?.message?.content?.trim();
-  if (!content) {
-    throw new Error("Zhipu response did not include auto reply content");
-  }
-  return content;
+  return result.content;
 }
 
 async function getFeishuTenantAccessToken(env: Env): Promise<string> {
@@ -673,46 +864,20 @@ async function summarizeWithZhipu(
   env: Env,
   prompt: string,
 ): Promise<{ content: string; raw: string }> {
-  if (!env.ZHIPU_API_KEY) {
-    throw new Error("ZHIPU_API_KEY is not configured");
-  }
-
-  const response = await fetch(
-    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        ...JSON_HEADERS,
-        authorization: `Bearer ${env.ZHIPU_API_KEY}`,
+  const config = await getModelConfig(env);
+  return callAI(
+    env,
+    config,
+    [
+      {
+        role: "system",
+        content:
+          "你是一个可靠的个人消息助理。请用简洁中文总结事实、待办和风险，不编造不存在的信息。",
       },
-      body: JSON.stringify({
-        model: env.ZHIPU_MODEL ?? "glm-4-flash",
-        messages: [
-          {
-            role: "system",
-            content:
-              "你是一个可靠的个人消息助理。请用简洁中文总结事实、待办和风险，不编造不存在的信息。",
-          },
-          { role: "user", content: prompt },
-        ],
-        temperature: 0.3,
-      }),
-    },
+      { role: "user", content: prompt },
+    ],
+    0.3,
   );
-
-  const raw = await response.text();
-  if (!response.ok) {
-    throw new Error(`Zhipu HTTP ${response.status}: ${raw}`);
-  }
-
-  const data = JSON.parse(raw) as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
-  const content = data.choices?.[0]?.message?.content?.trim();
-  if (!content) {
-    throw new Error("Zhipu response did not include summary content");
-  }
-  return { content, raw };
 }
 
 async function getSummary(env: Env, id: number): Promise<SummaryRecord | null> {
@@ -1278,6 +1443,43 @@ function renderAdminPage(): string {
         <tbody id="outgoing"></tbody>
       </table>
     </section>
+    <section>
+      <h2>AI 模型配置</h2>
+      <div style="padding:14px 16px;">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">
+          <button id="addModelBtn" class="secondary">+ 添加模型</button>
+          <span id="modelNotice" style="color:var(--muted);font-size:13px;align-self:center;"></span>
+        </div>
+        <div id="modelForm" style="display:none;border:1px solid var(--line);border-radius:6px;padding:14px;margin-bottom:14px;background:#fbfcfd;">
+          <div style="display:grid;gap:10px;grid-template-columns:1fr 1fr;">
+            <label style="display:grid;gap:4px;font-weight:650;font-size:13px;">
+              名称
+              <input id="modelName" placeholder="例如：智谱 GLM" style="border:1px solid var(--line);border-radius:6px;padding:9px 10px;font:inherit;">
+            </label>
+            <label style="display:grid;gap:4px;font-weight:650;font-size:13px;">
+              API 地址
+              <input id="modelBaseUrl" placeholder="https://open.bigmodel.cn/api/paas/v4" style="border:1px solid var(--line);border-radius:6px;padding:9px 10px;font:inherit;">
+            </label>
+            <label style="display:grid;gap:4px;font-weight:650;font-size:13px;">
+              API Key
+              <input id="modelApiKey" placeholder="sk-..." type="password" style="border:1px solid var(--line);border-radius:6px;padding:9px 10px;font:inherit;">
+            </label>
+            <label style="display:grid;gap:4px;font-weight:650;font-size:13px;">
+              模型 ID
+              <input id="modelId" placeholder="glm-4-flash" style="border:1px solid var(--line);border-radius:6px;padding:9px 10px;font:inherit;">
+            </label>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:12px;">
+            <button id="saveModelBtn" style="border:0;border-radius:6px;padding:9px 12px;background:var(--accent);color:white;cursor:pointer;font-weight:650;">保存</button>
+            <button id="cancelModelBtn" class="secondary" style="background:#eef4f2;color:var(--accent-strong);border:1px solid #c8ddd8;border-radius:6px;padding:9px 12px;cursor:pointer;font-weight:650;">取消</button>
+          </div>
+        </div>
+        <table>
+          <thead><tr><th>名称</th><th>API 地址</th><th>模型 ID</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="models"></tbody>
+        </table>
+      </div>
+    </section>
   </main>
   <script>
     const notice = document.getElementById('notice');
@@ -1299,10 +1501,11 @@ function renderAdminPage(): string {
 
     async function refresh() {
       setNotice('加载中...');
-      const [messages, summaries, outgoing] = await Promise.all([
+      const [messages, summaries, outgoing, models] = await Promise.all([
         api('/api/messages'),
         api('/api/summaries'),
-        api('/api/outgoing')
+        api('/api/outgoing'),
+        api('/api/models')
       ]);
       document.getElementById('messages').innerHTML = messages.messages.map((row) => \`
         <tr>
@@ -1330,6 +1533,23 @@ function renderAdminPage(): string {
           <td data-label="错误" class="content">\${escapeHtml(row.error || '')}</td>
         </tr>\`).join('') || '<tr><td colspan="4" class="muted">暂无发出记录</td></tr>';
 
+      document.getElementById('models').innerHTML = models.models.length
+        ? models.models.map((row) => \`
+            <tr>
+              <td data-label="名称">\${escapeHtml(row.name)}</td>
+              <td data-label="API 地址" class="content" style="font-size:12px;">\${escapeHtml(row.base_url)}</td>
+              <td data-label="模型 ID">\${escapeHtml(row.model)}</td>
+              <td data-label="状态">\${row.is_active
+                ? '<span style="color:var(--accent-strong);font-weight:700;">活跃</span>'
+                : '<span class="muted">未激活</span>'}</td>
+              <td data-label="操作" style="white-space:nowrap;">
+                \${row.is_active ? '' : '<button class="secondary" data-activate="' + row.id + '" style="margin-right:4px;">激活</button>'}
+                <button class="secondary" data-edit-model='\${escapeHtml(JSON.stringify(row))}'>编辑</button>
+                <button class="secondary" data-delete="\${row.id}" style="color:var(--danger);">删除</button>
+              </td>
+            </tr>\`).join('')
+        : '<tr><td colspan="5" class="muted">暂无模型配置，点击「+ 添加模型」添加</td></tr>';
+
       document.querySelectorAll('[data-resend]').forEach((button) => {
         button.addEventListener('click', async () => {
           setNotice('正在重发...');
@@ -1337,6 +1557,39 @@ function renderAdminPage(): string {
           await refresh();
         });
       });
+
+      document.querySelectorAll('[data-activate]').forEach((button) => {
+        button.addEventListener('click', async () => {
+          setNotice('正在激活...');
+          await api('/api/models/' + button.dataset.activate + '/activate', { method: 'POST' });
+          setNotice('已切换活跃模型');
+          await refresh();
+        });
+      });
+
+      document.querySelectorAll('[data-edit-model]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const model = JSON.parse(button.dataset.editModel);
+          document.getElementById('modelName').value = model.name;
+          document.getElementById('modelBaseUrl').value = model.base_url;
+          document.getElementById('modelApiKey').value = model.api_key;
+          document.getElementById('modelId').value = model.model;
+          document.getElementById('saveModelBtn').dataset.editId = model.id;
+          document.getElementById('modelForm').style.display = 'block';
+          document.getElementById('modelNotice').textContent = '';
+        });
+      });
+
+      document.querySelectorAll('[data-delete]').forEach((button) => {
+        button.addEventListener('click', async () => {
+          if (!confirm('确定要删除这个模型配置吗？')) return;
+          setNotice('正在删除...');
+          await api('/api/models/' + button.dataset.delete, { method: 'DELETE' });
+          setNotice('已删除');
+          await refresh();
+        });
+      });
+
       setNotice('已刷新 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false }));
     }
 
@@ -1355,6 +1608,48 @@ function renderAdminPage(): string {
       textarea.value = '';
       await refresh();
     });
+
+    document.getElementById('addModelBtn').addEventListener('click', () => {
+      document.getElementById('modelName').value = '';
+      document.getElementById('modelBaseUrl').value = '';
+      document.getElementById('modelApiKey').value = '';
+      document.getElementById('modelId').value = '';
+      delete document.getElementById('saveModelBtn').dataset.editId;
+      document.getElementById('modelForm').style.display = 'block';
+      document.getElementById('modelNotice').textContent = '';
+    });
+
+    document.getElementById('cancelModelBtn').addEventListener('click', () => {
+      document.getElementById('modelForm').style.display = 'none';
+      document.getElementById('modelNotice').textContent = '';
+    });
+
+    document.getElementById('saveModelBtn').addEventListener('click', async () => {
+      const name = document.getElementById('modelName').value.trim();
+      const base_url = document.getElementById('modelBaseUrl').value.trim();
+      const api_key = document.getElementById('modelApiKey').value.trim();
+      const model = document.getElementById('modelId').value.trim();
+      if (!name || !base_url || !api_key || !model) {
+        return document.getElementById('modelNotice').textContent = '请填写所有字段';
+      }
+      const editId = document.getElementById('saveModelBtn').dataset.editId;
+      setNotice('正在保存...');
+      if (editId) {
+        await api('/api/models/' + editId, {
+          method: 'PUT',
+          body: JSON.stringify({ name, base_url, api_key, model }),
+        });
+      } else {
+        await api('/api/models', {
+          method: 'POST',
+          body: JSON.stringify({ name, base_url, api_key, model }),
+        });
+      }
+      document.getElementById('modelForm').style.display = 'none';
+      setNotice('已保存');
+      await refresh();
+    });
+
     refresh().catch((error) => setNotice(error.message));
   </script>
 </body>
@@ -1595,76 +1890,57 @@ async function shouldSearchWithAI(
   env: Env,
   content: string,
 ): Promise<{ needSearch: boolean; query?: string }> {
-  if (!env.ZHIPU_API_KEY) {
+  let config: { base_url: string; api_key: string; model: string };
+  try {
+    config = await getModelConfig(env);
+  } catch {
     return { needSearch: false };
   }
 
   const hasKeywords = hasSearchKeywords(content);
 
-  const response = await fetch(
-    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        ...JSON_HEADERS,
-        authorization: `Bearer ${env.ZHIPU_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: env.ZHIPU_MODEL ?? "glm-4-flash",
-        messages: [
-          {
-            role: "system",
-            content:
-              "你是一个智能搜索决策助手。请分析用户的问题，判断是否需要进行联网搜索来获取最新信息。\n" +
-              "需要搜索的情况包括但不限于：\n" +
-              "- 需要最新新闻、事件、数据\n" +
-              "- 需要当前的价格、行情、天气\n" +
-              "- 需要了解最近发生的事情\n" +
-              "- 需要查找特定的事实或数据\n" +
-              "- 包含时间词（如今天、现在、最近、今日、当前）的问题\n" +
-              "- 询问新闻、动态、行情、价格等信息\n" +
-              "不需要搜索的情况包括：\n" +
-              "- 日常对话、闲聊（如你好、谢谢、再见）\n" +
-              "- 已有知识可以回答的问题（如什么是人工智能、历史知识）\n" +
-              "- 不需要最新信息的问题\n" +
-              '\n请输出 JSON 格式：{"needSearch": true/false, "query": "搜索关键词（如果需要搜索）"}',
-          },
-          {
-            role: "user",
-            content: content,
-          },
-        ],
-        temperature: 0.1,
-      }),
-    },
-  );
-
   try {
-    const raw = await response.text();
-    if (!response.ok) {
-      console.error(`Search decision HTTP ${response.status}: ${raw}`);
-      return { needSearch: hasKeywords, query: content };
-    }
+    const result = await callAI(
+      env,
+      config,
+      [
+        {
+          role: "system",
+          content:
+            "你是一个智能搜索决策助手。请分析用户的问题，判断是否需要进行联网搜索来获取最新信息。\n" +
+            "需要搜索的情况包括但不限于：\n" +
+            "- 需要最新新闻、事件、数据\n" +
+            "- 需要当前的价格、行情、天气\n" +
+            "- 需要了解最近发生的事情\n" +
+            "- 需要查找特定的事实或数据\n" +
+            "- 包含时间词（如今天、现在、最近、今日、当前）的问题\n" +
+            "- 询问新闻、动态、行情、价格等信息\n" +
+            "不需要搜索的情况包括：\n" +
+            "- 日常对话、闲聊（如你好、谢谢、再见）\n" +
+            "- 已有知识可以回答的问题（如什么是人工智能、历史知识）\n" +
+            "- 不需要最新信息的问题\n" +
+            '\n请输出 JSON 格式：{"needSearch": true/false, "query": "搜索关键词（如果需要搜索）"}',
+        },
+        {
+          role: "user",
+          content: content,
+        },
+      ],
+      0.1,
+    );
 
-    const data = JSON.parse(raw) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-    const contentText = data.choices?.[0]?.message?.content?.trim();
-
-    if (contentText) {
-      try {
-        const result = JSON.parse(contentText) as {
-          needSearch?: boolean;
-          query?: string;
-        };
-        const needSearch = result.needSearch === true || hasKeywords;
-        return {
-          needSearch,
-          query: result.query || content,
-        };
-      } catch {
-        console.error("Failed to parse search decision response");
-      }
+    try {
+      const parsed = JSON.parse(result.content) as {
+        needSearch?: boolean;
+        query?: string;
+      };
+      const needSearch = parsed.needSearch === true || hasKeywords;
+      return {
+        needSearch,
+        query: parsed.query || content,
+      };
+    } catch {
+      console.error("Failed to parse search decision response");
     }
   } catch (error) {
     console.error("Search decision failed:", error);
@@ -1701,55 +1977,30 @@ async function generateAutoReplyWithSearch(
     }
   }
 
-  if (!env.ZHIPU_API_KEY) {
-    throw new Error("ZHIPU_API_KEY is not configured");
-  }
-
-  const response = await fetch(
-    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        ...JSON_HEADERS,
-        authorization: `Bearer ${env.ZHIPU_API_KEY}`,
+  const config = await getModelConfig(env);
+  const result = await callAI(
+    env,
+    config,
+    [
+      {
+        role: "system",
+        content:
+          "你是飞书里的个人 AI 助手。请直接回复用户消息，中文为主，简洁、友好、可执行。\n" +
+          "如果提供了联网搜索结果，请优先参考搜索结果进行回答，并在回答中注明信息来源。\n" +
+          "不要声称你无法读取上下文之外的信息。",
       },
-      body: JSON.stringify({
-        model: env.ZHIPU_MODEL ?? "glm-4-flash",
-        messages: [
-          {
-            role: "system",
-            content:
-              "你是飞书里的个人 AI 助手。请直接回复用户消息，中文为主，简洁、友好、可执行。\n" +
-              "如果提供了联网搜索结果，请优先参考搜索结果进行回答，并在回答中注明信息来源。\n" +
-              "不要声称你无法读取上下文之外的信息。",
-          },
-          {
-            role: "user",
-            content: [
-              `发送者：${inbound.senderName || inbound.senderId || "未知"}`,
-              `消息类型：${inbound.messageType}`,
-              "消息内容：",
-              inbound.content,
-              searchResults,
-            ].join("\n"),
-          },
-        ],
-        temperature: 0.6,
-      }),
-    },
+      {
+        role: "user",
+        content: [
+          `发送者：${inbound.senderName || inbound.senderId || "未知"}`,
+          `消息类型：${inbound.messageType}`,
+          "消息内容：",
+          inbound.content,
+          searchResults,
+        ].join("\n"),
+      },
+    ],
+    0.6,
   );
-
-  const raw = await response.text();
-  if (!response.ok) {
-    throw new Error(`Zhipu auto reply HTTP ${response.status}: ${raw}`);
-  }
-
-  const data = JSON.parse(raw) as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
-  const content = data.choices?.[0]?.message?.content?.trim();
-  if (!content) {
-    throw new Error("Zhipu response did not include auto reply content");
-  }
-  return content;
+  return result.content;
 }
