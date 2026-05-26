@@ -1,17 +1,19 @@
 export interface Env {
   DB: D1Database;
-  ADMIN_USERNAME: string;
-  ADMIN_PASSWORD: string;
+  ADMIN_USERNAME?: string;
+  ADMIN_PASSWORD?: string;
   FEISHU_VERIFICATION_TOKEN?: string;
   FEISHU_APP_ID?: string;
   FEISHU_APP_SECRET?: string;
   FEISHU_TARGET_RECEIVE_ID?: string;
   FEISHU_TARGET_RECEIVE_ID_TYPE?: string;
   FEISHU_BOT_WEBHOOK?: string;
-  ZHIPU_API_KEY: string;
+  ZHIPU_API_KEY?: string;
   ZHIPU_MODEL?: string;
   AUTO_REPLY_ENABLED?: string;
   TZ?: string;
+  SEARCH_API_KEY?: string;
+  SEARCH_API_ENDPOINT?: string;
 }
 
 type FeishuInbound = {
@@ -21,6 +23,13 @@ type FeishuInbound = {
   senderName?: string;
   messageType: string;
   content: string;
+};
+
+type SearchResult = {
+  title: string;
+  link: string;
+  snippet: string;
+  source?: string;
 };
 
 type SummaryRecord = {
@@ -47,7 +56,11 @@ const HTML_HEADERS = {
 const SESSION_COOKIE = "fd_session";
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
     const url = new URL(request.url);
 
     try {
@@ -64,6 +77,17 @@ export default {
       }
 
       if (url.pathname === "/admin" && request.method === "GET") {
+        if (!env.ADMIN_PASSWORD) {
+          return new Response(
+            renderLoginPage(
+              "ADMIN_PASSWORD 环境变量未配置，请在 Cloudflare Workers 中设置该变量",
+            ),
+            {
+              status: 401,
+              headers: HTML_HEADERS,
+            },
+          );
+        }
         if (!(await isAdminSession(request, env))) {
           return new Response(renderLoginPage(), { headers: HTML_HEADERS });
         }
@@ -84,7 +108,8 @@ export default {
       }
 
       if (url.pathname.startsWith("/api/")) {
-        if (!(await isAdminSession(request, env))) return json({ error: "Unauthorized" }, 401);
+        if (!(await isAdminSession(request, env)))
+          return json({ error: "Unauthorized" }, 401);
         return handleApi(request, env, url);
       }
 
@@ -96,11 +121,18 @@ export default {
   },
 
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
-    await createAndSendDailySummary(env, { refreshExisting: true, sendEvenIfSent: true });
+    await createAndSendDailySummary(env, {
+      refreshExisting: true,
+      sendEvenIfSent: true,
+    });
   },
 };
 
-async function handleFeishuWebhook(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+async function handleFeishuWebhook(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
   const payload = await request.json<unknown>();
   const body = payload as Record<string, unknown>;
 
@@ -139,7 +171,11 @@ async function handleFeishuWebhook(request: Request, env: Env, ctx: ExecutionCon
   return json({ ok: true });
 }
 
-async function handleApi(request: Request, env: Env, url: URL): Promise<Response> {
+async function handleApi(
+  request: Request,
+  env: Env,
+  url: URL,
+): Promise<Response> {
   if (url.pathname === "/api/messages" && request.method === "GET") {
     const limit = clamp(Number(url.searchParams.get("limit") ?? 100), 1, 300);
     const rows = await env.DB.prepare(
@@ -167,7 +203,16 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
   }
 
   if (url.pathname === "/api/summaries/run" && request.method === "POST") {
-    const summary = await createAndSendDailySummary(env, { refreshExisting: true, sendEvenIfSent: true });
+    if (!env.ZHIPU_API_KEY) {
+      return json(
+        { error: "ZHIPU_API_KEY 未配置，请在 Cloudflare Workers 中设置该变量" },
+        500,
+      );
+    }
+    const summary = await createAndSendDailySummary(env, {
+      refreshExisting: true,
+      sendEvenIfSent: true,
+    });
     return json({ summary });
   }
 
@@ -197,8 +242,43 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     const content = (body.content ?? "").trim();
     if (!content) return json({ error: "content is required" }, 400);
     const result = await sendFeishuText(env, content);
-    await recordOutgoing(env, null, content, result.ok ? "sent" : "failed", result.error);
+    await recordOutgoing(
+      env,
+      null,
+      content,
+      result.ok ? "sent" : "failed",
+      result.error,
+    );
     return json({ result });
+  }
+
+  if (url.pathname === "/api/search/test" && request.method === "POST") {
+    const body = await request.json<{ query?: string }>();
+    const query = (body.query ?? "").trim();
+    if (!query) return json({ error: "query is required" }, 400);
+
+    const hasKeywords = hasSearchKeywords(query);
+
+    const { needSearch, query: suggestedQuery } = await shouldSearchWithAI(
+      env,
+      query,
+    );
+    const searchResult = needSearch
+      ? await webSearchWithDebug(env, suggestedQuery || query)
+      : { results: [], error: null, response: null };
+
+    return json({
+      query,
+      hasKeywords,
+      needSearch,
+      suggestedQuery,
+      searchResults: searchResult.results,
+      searchEnabled: !!env.SEARCH_API_KEY,
+      searchError: searchResult.error,
+      searchResponse: searchResult.response
+        ? JSON.stringify(searchResult.response).slice(0, 1000)
+        : null,
+    });
   }
 
   return json({ error: "Not found" }, 404);
@@ -208,7 +288,10 @@ async function createAndSendDailySummary(
   env: Env,
   options: { refreshExisting?: boolean; sendEvenIfSent?: boolean } = {},
 ): Promise<SummaryRecord> {
-  const summaryDate = formatDateInTimeZone(new Date(), env.TZ ?? "Asia/Shanghai");
+  const summaryDate = formatDateInTimeZone(
+    new Date(),
+    env.TZ ?? "Asia/Shanghai",
+  );
   const existing = await env.DB.prepare(
     `SELECT id, summary_date, content, source_message_count, prompt, raw_response, sent_status, sent_error, sent_at, created_at
      FROM summaries
@@ -218,7 +301,9 @@ async function createAndSendDailySummary(
     .first<SummaryRecord>();
 
   const summary =
-    existing && options.refreshExisting ? await updateSummary(env, existing.id, summaryDate) : existing ?? (await createSummary(env, summaryDate));
+    existing && options.refreshExisting
+      ? await updateSummary(env, existing.id, summaryDate)
+      : (existing ?? (await createSummary(env, summaryDate)));
   if (options.sendEvenIfSent || summary.sent_status !== "sent") {
     await sendSummaryToFeishu(env, summary);
     return (await getSummary(env, summary.id)) ?? summary;
@@ -226,14 +311,23 @@ async function createAndSendDailySummary(
   return summary;
 }
 
-async function createSummary(env: Env, summaryDate: string): Promise<SummaryRecord> {
+async function createSummary(
+  env: Env,
+  summaryDate: string,
+): Promise<SummaryRecord> {
   const summary = await buildSummary(env, summaryDate);
 
   const insert = await env.DB.prepare(
     `INSERT INTO summaries (summary_date, content, source_message_count, prompt, raw_response)
      VALUES (?, ?, ?, ?, ?)`,
   )
-    .bind(summaryDate, summary.content, summary.sourceMessageCount, summary.prompt, summary.raw)
+    .bind(
+      summaryDate,
+      summary.content,
+      summary.sourceMessageCount,
+      summary.prompt,
+      summary.raw,
+    )
     .run();
 
   const id = Number(insert.meta.last_row_id);
@@ -242,7 +336,11 @@ async function createSummary(env: Env, summaryDate: string): Promise<SummaryReco
   return created;
 }
 
-async function updateSummary(env: Env, id: number, summaryDate: string): Promise<SummaryRecord> {
+async function updateSummary(
+  env: Env,
+  id: number,
+  summaryDate: string,
+): Promise<SummaryRecord> {
   const summary = await buildSummary(env, summaryDate);
   await env.DB.prepare(
     `UPDATE summaries
@@ -250,7 +348,13 @@ async function updateSummary(env: Env, id: number, summaryDate: string): Promise
          sent_error = NULL, sent_at = NULL
      WHERE id = ?`,
   )
-    .bind(summary.content, summary.sourceMessageCount, summary.prompt, summary.raw, id)
+    .bind(
+      summary.content,
+      summary.sourceMessageCount,
+      summary.prompt,
+      summary.raw,
+      id,
+    )
     .run();
 
   const updated = await getSummary(env, id);
@@ -261,7 +365,12 @@ async function updateSummary(env: Env, id: number, summaryDate: string): Promise
 async function buildSummary(
   env: Env,
   summaryDate: string,
-): Promise<{ content: string; sourceMessageCount: number; prompt: string; raw: string }> {
+): Promise<{
+  content: string;
+  sourceMessageCount: number;
+  prompt: string;
+  raw: string;
+}> {
   const range = getShanghaiDayRange(summaryDate);
   const messages = await env.DB.prepare(
     `SELECT sender_name, sender_id, content, received_at
@@ -270,7 +379,12 @@ async function buildSummary(
      ORDER BY received_at ASC`,
   )
     .bind(range.startUtc, range.endUtc)
-    .all<{ sender_name: string | null; sender_id: string | null; content: string; received_at: string }>();
+    .all<{
+      sender_name: string | null;
+      sender_id: string | null;
+      content: string;
+      received_at: string;
+    }>();
 
   const prompt = buildSummaryPrompt(summaryDate, messages.results);
   const ai = await summarizeWithZhipu(env, prompt);
@@ -282,7 +396,10 @@ async function buildSummary(
   };
 }
 
-async function sendSummaryToFeishu(env: Env, summary: SummaryRecord): Promise<{ ok: boolean; error?: string }> {
+async function sendSummaryToFeishu(
+  env: Env,
+  summary: SummaryRecord,
+): Promise<{ ok: boolean; error?: string }> {
   const text = `每日消息总结 ${summary.summary_date}\n\n${summary.content}`;
   const result = await sendFeishuText(env, text);
   await env.DB.prepare(
@@ -290,14 +407,32 @@ async function sendSummaryToFeishu(env: Env, summary: SummaryRecord): Promise<{ 
      SET sent_status = ?, sent_error = ?, sent_at = ?
      WHERE id = ?`,
   )
-    .bind(result.ok ? "sent" : "failed", result.error ?? null, result.ok ? new Date().toISOString() : null, summary.id)
+    .bind(
+      result.ok ? "sent" : "failed",
+      result.error ?? null,
+      result.ok ? new Date().toISOString() : null,
+      summary.id,
+    )
     .run();
-  await recordOutgoing(env, summary.id, text, result.ok ? "sent" : "failed", result.error);
+  await recordOutgoing(
+    env,
+    summary.id,
+    text,
+    result.ok ? "sent" : "failed",
+    result.error,
+  );
   return result;
 }
 
-async function sendFeishuText(env: Env, text: string): Promise<{ ok: boolean; error?: string }> {
-  if (env.FEISHU_APP_ID && env.FEISHU_APP_SECRET && env.FEISHU_TARGET_RECEIVE_ID) {
+async function sendFeishuText(
+  env: Env,
+  text: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (
+    env.FEISHU_APP_ID &&
+    env.FEISHU_APP_SECRET &&
+    env.FEISHU_TARGET_RECEIVE_ID
+  ) {
     return sendFeishuAppText(
       env,
       text,
@@ -325,14 +460,25 @@ async function sendFeishuText(env: Env, text: string): Promise<{ ok: boolean; er
 
   const responseText = await response.text();
   if (!response.ok) {
-    return { ok: false, error: `Feishu webhook HTTP ${response.status}: ${responseText}` };
+    return {
+      ok: false,
+      error: `Feishu webhook HTTP ${response.status}: ${responseText}`,
+    };
   }
 
   try {
-    const data = JSON.parse(responseText) as { code?: number; StatusCode?: number; msg?: string; StatusMessage?: string };
+    const data = JSON.parse(responseText) as {
+      code?: number;
+      StatusCode?: number;
+      msg?: string;
+      StatusMessage?: string;
+    };
     const code = data.code ?? data.StatusCode ?? 0;
     if (code !== 0) {
-      return { ok: false, error: data.msg ?? data.StatusMessage ?? responseText };
+      return {
+        ok: false,
+        error: data.msg ?? data.StatusMessage ?? responseText,
+      };
     }
   } catch {
     // Some webhook variants return an empty body on success.
@@ -366,7 +512,10 @@ async function sendFeishuAppText(
 
   const responseText = await response.text();
   if (!response.ok) {
-    return { ok: false, error: `Feishu message HTTP ${response.status}: ${responseText}` };
+    return {
+      ok: false,
+      error: `Feishu message HTTP ${response.status}: ${responseText}`,
+    };
   }
 
   const data = JSON.parse(responseText) as { code?: number; msg?: string };
@@ -376,59 +525,87 @@ async function sendFeishuAppText(
   return { ok: true };
 }
 
-async function autoReplyToInboundMessage(env: Env, inbound: FeishuInbound): Promise<void> {
+async function autoReplyToInboundMessage(
+  env: Env,
+  inbound: FeishuInbound,
+): Promise<void> {
   if (!inbound.chatId) return;
 
   try {
-    const reply = await generateAutoReply(env, inbound);
-    const result = await sendFeishuAppText(env, reply, inbound.chatId, "chat_id");
-    await recordOutgoing(env, null, reply, result.ok ? "sent" : "failed", result.error);
+    const reply = await generateAutoReplyWithSearch(env, inbound);
+    const result = await sendFeishuAppText(
+      env,
+      reply,
+      inbound.chatId,
+      "chat_id",
+    );
+    await recordOutgoing(
+      env,
+      null,
+      reply,
+      result.ok ? "sent" : "failed",
+      result.error,
+    );
   } catch (error) {
     const errorText = errorMessage(error);
-    await recordOutgoing(env, null, `自动回复失败：${inbound.content}`, "failed", errorText);
+    await recordOutgoing(
+      env,
+      null,
+      `自动回复失败：${inbound.content}`,
+      "failed",
+      errorText,
+    );
     console.error("auto reply failed", error);
   }
 }
 
-async function generateAutoReply(env: Env, inbound: FeishuInbound): Promise<string> {
+async function generateAutoReply(
+  env: Env,
+  inbound: FeishuInbound,
+): Promise<string> {
   if (!env.ZHIPU_API_KEY) {
     throw new Error("ZHIPU_API_KEY is not configured");
   }
 
-  const response = await fetch("https://open.bigmodel.cn/api/paas/v4/chat/completions", {
-    method: "POST",
-    headers: {
-      ...JSON_HEADERS,
-      authorization: `Bearer ${env.ZHIPU_API_KEY}`,
+  const response = await fetch(
+    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        ...JSON_HEADERS,
+        authorization: `Bearer ${env.ZHIPU_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: env.ZHIPU_MODEL ?? "glm-4-flash",
+        messages: [
+          {
+            role: "system",
+            content:
+              "你是飞书里的个人 AI 助手。请直接回复用户消息，中文为主，简洁、友好、可执行。不要声称你无法读取上下文之外的信息。",
+          },
+          {
+            role: "user",
+            content: [
+              `发送者：${inbound.senderName || inbound.senderId || "未知"}`,
+              `消息类型：${inbound.messageType}`,
+              "消息内容：",
+              inbound.content,
+            ].join("\n"),
+          },
+        ],
+        temperature: 0.6,
+      }),
     },
-    body: JSON.stringify({
-      model: env.ZHIPU_MODEL ?? "glm-4-flash",
-      messages: [
-        {
-          role: "system",
-          content:
-            "你是飞书里的个人 AI 助手。请直接回复用户消息，中文为主，简洁、友好、可执行。不要声称你无法读取上下文之外的信息。",
-        },
-        {
-          role: "user",
-          content: [
-            `发送者：${inbound.senderName || inbound.senderId || "未知"}`,
-            `消息类型：${inbound.messageType}`,
-            "消息内容：",
-            inbound.content,
-          ].join("\n"),
-        },
-      ],
-      temperature: 0.6,
-    }),
-  });
+  );
 
   const raw = await response.text();
   if (!response.ok) {
     throw new Error(`Zhipu auto reply HTTP ${response.status}: ${raw}`);
   }
 
-  const data = JSON.parse(raw) as { choices?: Array<{ message?: { content?: string } }> };
+  const data = JSON.parse(raw) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
   const content = data.choices?.[0]?.message?.content?.trim();
   if (!content) {
     throw new Error("Zhipu response did not include auto reply content");
@@ -441,14 +618,17 @@ async function getFeishuTenantAccessToken(env: Env): Promise<string> {
     throw new Error("FEISHU_APP_ID and FEISHU_APP_SECRET are required");
   }
 
-  const response = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
-    method: "POST",
-    headers: JSON_HEADERS,
-    body: JSON.stringify({
-      app_id: env.FEISHU_APP_ID,
-      app_secret: env.FEISHU_APP_SECRET,
-    }),
-  });
+  const response = await fetch(
+    "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+    {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        app_id: env.FEISHU_APP_ID,
+        app_secret: env.FEISHU_APP_SECRET,
+      }),
+    },
+  );
 
   const responseText = await response.text();
   if (!response.ok) {
@@ -461,7 +641,9 @@ async function getFeishuTenantAccessToken(env: Env): Promise<string> {
     tenant_access_token?: string;
   };
   if ((data.code ?? 0) !== 0 || !data.tenant_access_token) {
-    throw new Error(data.msg ?? "Feishu token response did not include tenant_access_token");
+    throw new Error(
+      data.msg ?? "Feishu token response did not include tenant_access_token",
+    );
   }
   return data.tenant_access_token;
 }
@@ -477,40 +659,55 @@ async function recordOutgoing(
     `INSERT INTO outgoing_messages (summary_id, content, status, error, sent_at)
      VALUES (?, ?, ?, ?, ?)`,
   )
-    .bind(summaryId, content, status, error ?? null, status === "sent" ? new Date().toISOString() : null)
+    .bind(
+      summaryId,
+      content,
+      status,
+      error ?? null,
+      status === "sent" ? new Date().toISOString() : null,
+    )
     .run();
 }
 
-async function summarizeWithZhipu(env: Env, prompt: string): Promise<{ content: string; raw: string }> {
+async function summarizeWithZhipu(
+  env: Env,
+  prompt: string,
+): Promise<{ content: string; raw: string }> {
   if (!env.ZHIPU_API_KEY) {
     throw new Error("ZHIPU_API_KEY is not configured");
   }
 
-  const response = await fetch("https://open.bigmodel.cn/api/paas/v4/chat/completions", {
-    method: "POST",
-    headers: {
-      ...JSON_HEADERS,
-      authorization: `Bearer ${env.ZHIPU_API_KEY}`,
+  const response = await fetch(
+    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        ...JSON_HEADERS,
+        authorization: `Bearer ${env.ZHIPU_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: env.ZHIPU_MODEL ?? "glm-4-flash",
+        messages: [
+          {
+            role: "system",
+            content:
+              "你是一个可靠的个人消息助理。请用简洁中文总结事实、待办和风险，不编造不存在的信息。",
+          },
+          { role: "user", content: prompt },
+        ],
+        temperature: 0.3,
+      }),
     },
-    body: JSON.stringify({
-      model: env.ZHIPU_MODEL ?? "glm-4-flash",
-      messages: [
-        {
-          role: "system",
-          content: "你是一个可靠的个人消息助理。请用简洁中文总结事实、待办和风险，不编造不存在的信息。",
-        },
-        { role: "user", content: prompt },
-      ],
-      temperature: 0.3,
-    }),
-  });
+  );
 
   const raw = await response.text();
   if (!response.ok) {
     throw new Error(`Zhipu HTTP ${response.status}: ${raw}`);
   }
 
-  const data = JSON.parse(raw) as { choices?: Array<{ message?: { content?: string } }> };
+  const data = JSON.parse(raw) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
   const content = data.choices?.[0]?.message?.content?.trim();
   if (!content) {
     throw new Error("Zhipu response did not include summary content");
@@ -530,7 +727,12 @@ async function getSummary(env: Env, id: number): Promise<SummaryRecord | null> {
 
 function buildSummaryPrompt(
   summaryDate: string,
-  messages: Array<{ sender_name: string | null; sender_id: string | null; content: string; received_at: string }>,
+  messages: Array<{
+    sender_name: string | null;
+    sender_id: string | null;
+    content: string;
+    received_at: string;
+  }>,
 ): string {
   if (messages.length === 0) {
     return `日期：${summaryDate}\n今天没有收到可总结的飞书消息。请输出一句简短总结。`;
@@ -562,13 +764,20 @@ function extractFeishuMessage(body: Record<string, unknown>): FeishuInbound {
   const senderId = asRecord(sender?.sender_id);
 
   const rawContent = message.content;
-  const messageType = stringValue(message.message_type) ?? stringValue(message.msg_type) ?? "text";
+  const messageType =
+    stringValue(message.message_type) ??
+    stringValue(message.msg_type) ??
+    "text";
   const content = parseFeishuContent(rawContent, messageType);
 
   return {
-    messageId: stringValue(message.message_id) ?? stringValue(message.open_message_id),
+    messageId:
+      stringValue(message.message_id) ?? stringValue(message.open_message_id),
     chatId: stringValue(message.chat_id) ?? stringValue(event.open_chat_id),
-    senderId: stringValue(senderId?.user_id) ?? stringValue(senderId?.open_id) ?? stringValue(event.open_id),
+    senderId:
+      stringValue(senderId?.user_id) ??
+      stringValue(senderId?.open_id) ??
+      stringValue(event.open_id),
     senderName: stringValue(sender?.sender_type),
     messageType,
     content,
@@ -585,28 +794,37 @@ function parseFeishuContent(rawContent: unknown, messageType: string): string {
     }
   }
   if (asRecord(rawContent)) {
-    return contentFromParsedFeishuContent(rawContent as Record<string, unknown>, messageType);
+    return contentFromParsedFeishuContent(
+      rawContent as Record<string, unknown>,
+      messageType,
+    );
   }
   return "";
 }
 
-function contentFromParsedFeishuContent(content: Record<string, unknown>, messageType: string): string {
+function contentFromParsedFeishuContent(
+  content: Record<string, unknown>,
+  messageType: string,
+): string {
   if (typeof content.text === "string") return content.text;
   if (typeof content.title === "string") return content.title;
-  if (messageType !== "text") return `[${messageType}] ${JSON.stringify(content)}`;
+  if (messageType !== "text")
+    return `[${messageType}] ${JSON.stringify(content)}`;
   return JSON.stringify(content);
 }
 
 function validateFeishuToken(body: Record<string, unknown>, env: Env): void {
   if (!env.FEISHU_VERIFICATION_TOKEN) return;
-  const token = stringValue(body.token) ?? stringValue(asRecord(body.header)?.token);
+  const token =
+    stringValue(body.token) ?? stringValue(asRecord(body.header)?.token);
   if (token !== env.FEISHU_VERIFICATION_TOKEN) {
     throw new Error("Invalid Feishu verification token");
   }
 }
 
 function shouldAutoReply(env: Env, inbound: FeishuInbound): boolean {
-  if ((env.AUTO_REPLY_ENABLED ?? "true").toLowerCase() === "false") return false;
+  if ((env.AUTO_REPLY_ENABLED ?? "true").toLowerCase() === "false")
+    return false;
   if (!env.FEISHU_APP_ID || !env.FEISHU_APP_SECRET) return false;
   if (!inbound.chatId) return false;
   if (!inbound.content.trim()) return false;
@@ -614,14 +832,26 @@ function shouldAutoReply(env: Env, inbound: FeishuInbound): boolean {
 }
 
 async function handleLogin(request: Request, env: Env): Promise<Response> {
-  if (!env.ADMIN_PASSWORD) {
-    return new Response("ADMIN_PASSWORD is not configured", { status: 500 });
-  }
-
   const form = await request.formData();
   const username = String(form.get("username") ?? "");
   const password = String(form.get("password") ?? "");
-  if (username !== (env.ADMIN_USERNAME || "admin") || password !== env.ADMIN_PASSWORD) {
+
+  if (!env.ADMIN_PASSWORD) {
+    return new Response(
+      renderLoginPage(
+        "ADMIN_PASSWORD 环境变量未配置，请在 Cloudflare Workers 中设置该变量",
+      ),
+      {
+        status: 401,
+        headers: HTML_HEADERS,
+      },
+    );
+  }
+
+  if (
+    username !== (env.ADMIN_USERNAME || "admin") ||
+    password !== env.ADMIN_PASSWORD
+  ) {
     return new Response(renderLoginPage("账号或密码不正确"), {
       status: 401,
       headers: HTML_HEADERS,
@@ -638,7 +868,8 @@ async function isAdminSession(request: Request, env: Env): Promise<boolean> {
 
   const [expiresText, signature] = cookie.split(".");
   const expires = Number(expiresText);
-  if (!Number.isFinite(expires) || !signature || Date.now() > expires) return false;
+  if (!Number.isFinite(expires) || !signature || Date.now() > expires)
+    return false;
 
   const expected = await signSession(env, expiresText);
   return timingSafeEqual(signature, expected);
@@ -663,7 +894,11 @@ async function signSession(env: Env, value: string): Promise<string> {
     false,
     ["sign"],
   );
-  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(value),
+  );
   return base64Url(signature);
 }
 
@@ -690,7 +925,10 @@ function base64Url(value: ArrayBuffer): string {
   for (const byte of bytes) {
     binary += String.fromCharCode(byte);
   }
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
 }
 
 function renderLoginPage(error = ""): string {
@@ -1190,8 +1428,328 @@ function formatDateInTimeZone(date: Date, timeZone: string): string {
   return formatter.format(date);
 }
 
-function getShanghaiDayRange(summaryDate: string): { startUtc: string; endUtc: string } {
+function getShanghaiDayRange(summaryDate: string): {
+  startUtc: string;
+  endUtc: string;
+} {
   const start = new Date(`${summaryDate}T00:00:00+08:00`);
   const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
   return { startUtc: start.toISOString(), endUtc: end.toISOString() };
+}
+
+async function webSearch(env: Env, query: string): Promise<SearchResult[]> {
+  if (!env.SEARCH_API_KEY) {
+    return [];
+  }
+
+  const endpoint = env.SEARCH_API_ENDPOINT || "https://serpapi.com/search";
+  const url = new URL(endpoint);
+  url.searchParams.set("q", query);
+  url.searchParams.set("api_key", env.SEARCH_API_KEY);
+  url.searchParams.set("engine", "google");
+  url.searchParams.set("num", "5");
+  url.searchParams.set("hl", "zh-CN");
+
+  try {
+    const response = await fetch(url.toString(), { method: "GET" });
+    if (!response.ok) {
+      console.error(`Search API HTTP ${response.status}`);
+      return [];
+    }
+
+    const data = (await response.json()) as Record<string, unknown>;
+    const results =
+      (data.organic_results as Array<Record<string, unknown>>) ||
+      (data.results as Array<Record<string, unknown>>) ||
+      [];
+
+    return results
+      .map((result) => ({
+        title: String(result.title || ""),
+        link: String(result.link || ""),
+        snippet: String(result.snippet || ""),
+        source: String(result.source || ""),
+      }))
+      .filter((r) => r.title && r.link);
+  } catch (error) {
+    console.error("Search failed:", error);
+    return [];
+  }
+}
+
+async function webSearchWithDebug(
+  env: Env,
+  query: string,
+): Promise<{
+  results: SearchResult[];
+  error: string | null;
+  response: Record<string, unknown> | null;
+}> {
+  if (!env.SEARCH_API_KEY) {
+    return {
+      results: [],
+      error: "SEARCH_API_KEY not configured",
+      response: null,
+    };
+  }
+
+  const endpoint = env.SEARCH_API_ENDPOINT || "https://serpapi.com/search";
+  const url = new URL(endpoint);
+  url.searchParams.set("q", query);
+  url.searchParams.set("api_key", env.SEARCH_API_KEY);
+  url.searchParams.set("engine", "google");
+  url.searchParams.set("num", "5");
+  url.searchParams.set("hl", "zh-CN");
+
+  try {
+    const response = await fetch(url.toString(), { method: "GET" });
+    const responseText = await response.text();
+
+    console.log(
+      `Search URL: ${url.toString().replace(env.SEARCH_API_KEY, "[REDACTED]")}`,
+    );
+    console.log(`Search HTTP status: ${response.status}`);
+    console.log(`Search response: ${responseText.slice(0, 500)}`);
+
+    if (!response.ok) {
+      const errorMsg = `Search API HTTP ${response.status}: ${responseText.slice(0, 200)}`;
+      console.error(errorMsg);
+      return { results: [], error: errorMsg, response: null };
+    }
+
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(responseText);
+    } catch {
+      return {
+        results: [],
+        error: "Failed to parse response as JSON",
+        response: null,
+      };
+    }
+
+    const results =
+      (data.organic_results as Array<Record<string, unknown>>) ||
+      (data.results as Array<Record<string, unknown>>) ||
+      [];
+    console.log(`Search returned ${results.length} results`);
+
+    return {
+      results: results
+        .map((result) => ({
+          title: String(result.title || ""),
+          link: String(result.link || ""),
+          snippet: String(result.snippet || ""),
+          source: String(result.source || ""),
+        }))
+        .filter((r) => r.title && r.link),
+      error: null,
+      response: data,
+    };
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    console.error("Search failed:", errorMsg);
+    return { results: [], error: errorMsg, response: null };
+  }
+}
+
+function hasSearchKeywords(content: string): boolean {
+  const searchKeywords = [
+    "最新",
+    "今天",
+    "现在",
+    "最近",
+    "今日",
+    "当前",
+    "新闻",
+    "动态",
+    "行情",
+    "价格",
+    "天气",
+    "股票",
+    "汇率",
+    "发布",
+    "上市",
+    "更新",
+    "公告",
+    "政策",
+    "通知",
+    "多少",
+    "什么是",
+    "怎么样",
+    "如何",
+    "哪里",
+    "何时",
+    "新闻",
+    "热搜",
+    "热点",
+    "事件",
+    "消息",
+  ];
+
+  const text = content.toLowerCase();
+  return searchKeywords.some((keyword) => text.includes(keyword.toLowerCase()));
+}
+
+async function shouldSearchWithAI(
+  env: Env,
+  content: string,
+): Promise<{ needSearch: boolean; query?: string }> {
+  if (!env.ZHIPU_API_KEY) {
+    return { needSearch: false };
+  }
+
+  const hasKeywords = hasSearchKeywords(content);
+
+  const response = await fetch(
+    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        ...JSON_HEADERS,
+        authorization: `Bearer ${env.ZHIPU_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: env.ZHIPU_MODEL ?? "glm-4-flash",
+        messages: [
+          {
+            role: "system",
+            content:
+              "你是一个智能搜索决策助手。请分析用户的问题，判断是否需要进行联网搜索来获取最新信息。\n" +
+              "需要搜索的情况包括但不限于：\n" +
+              "- 需要最新新闻、事件、数据\n" +
+              "- 需要当前的价格、行情、天气\n" +
+              "- 需要了解最近发生的事情\n" +
+              "- 需要查找特定的事实或数据\n" +
+              "- 包含时间词（如今天、现在、最近、今日、当前）的问题\n" +
+              "- 询问新闻、动态、行情、价格等信息\n" +
+              "不需要搜索的情况包括：\n" +
+              "- 日常对话、闲聊（如你好、谢谢、再见）\n" +
+              "- 已有知识可以回答的问题（如什么是人工智能、历史知识）\n" +
+              "- 不需要最新信息的问题\n" +
+              '\n请输出 JSON 格式：{"needSearch": true/false, "query": "搜索关键词（如果需要搜索）"}',
+          },
+          {
+            role: "user",
+            content: content,
+          },
+        ],
+        temperature: 0.1,
+      }),
+    },
+  );
+
+  try {
+    const raw = await response.text();
+    if (!response.ok) {
+      console.error(`Search decision HTTP ${response.status}: ${raw}`);
+      return { needSearch: hasKeywords, query: content };
+    }
+
+    const data = JSON.parse(raw) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const contentText = data.choices?.[0]?.message?.content?.trim();
+
+    if (contentText) {
+      try {
+        const result = JSON.parse(contentText) as {
+          needSearch?: boolean;
+          query?: string;
+        };
+        const needSearch = result.needSearch === true || hasKeywords;
+        return {
+          needSearch,
+          query: result.query || content,
+        };
+      } catch {
+        console.error("Failed to parse search decision response");
+      }
+    }
+  } catch (error) {
+    console.error("Search decision failed:", error);
+  }
+
+  return { needSearch: hasKeywords, query: content };
+}
+
+function formatSearchResults(results: SearchResult[]): string {
+  if (results.length === 0) return "";
+
+  return `\n\n【联网搜索结果】\n${results
+    .map(
+      (result, index) =>
+        `${index + 1}. ${result.title}\n   ${result.snippet}\n   来源: ${result.link}`,
+    )
+    .join("\n\n")}`;
+}
+
+async function generateAutoReplyWithSearch(
+  env: Env,
+  inbound: FeishuInbound,
+): Promise<string> {
+  let searchResults = "";
+
+  if (env.SEARCH_API_KEY) {
+    const { needSearch, query } = await shouldSearchWithAI(
+      env,
+      inbound.content,
+    );
+    if (needSearch) {
+      const results = await webSearch(env, query || inbound.content);
+      searchResults = formatSearchResults(results);
+    }
+  }
+
+  if (!env.ZHIPU_API_KEY) {
+    throw new Error("ZHIPU_API_KEY is not configured");
+  }
+
+  const response = await fetch(
+    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        ...JSON_HEADERS,
+        authorization: `Bearer ${env.ZHIPU_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: env.ZHIPU_MODEL ?? "glm-4-flash",
+        messages: [
+          {
+            role: "system",
+            content:
+              "你是飞书里的个人 AI 助手。请直接回复用户消息，中文为主，简洁、友好、可执行。\n" +
+              "如果提供了联网搜索结果，请优先参考搜索结果进行回答，并在回答中注明信息来源。\n" +
+              "不要声称你无法读取上下文之外的信息。",
+          },
+          {
+            role: "user",
+            content: [
+              `发送者：${inbound.senderName || inbound.senderId || "未知"}`,
+              `消息类型：${inbound.messageType}`,
+              "消息内容：",
+              inbound.content,
+              searchResults,
+            ].join("\n"),
+          },
+        ],
+        temperature: 0.6,
+      }),
+    },
+  );
+
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(`Zhipu auto reply HTTP ${response.status}: ${raw}`);
+  }
+
+  const data = JSON.parse(raw) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const content = data.choices?.[0]?.message?.content?.trim();
+  if (!content) {
+    throw new Error("Zhipu response did not include auto reply content");
+  }
+  return content;
 }

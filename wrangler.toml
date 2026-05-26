@@ -25,3 +25,7 @@ ZHIPU_MODEL = "glm-4-flash"
 AUTO_REPLY_ENABLED = "true"
 # Feishu message API receive_id_type. Common values: chat_id, open_id, user_id, union_id, email.
 FEISHU_TARGET_RECEIVE_ID_TYPE = "chat_id"
+
+[observability.logs]
+enabled = true
+invocation_logs = true

@@ -7,3 +7,8 @@ FEISHU_TARGET_RECEIVE_ID_TYPE="chat_id"
 AUTO_REPLY_ENABLED="true"
 FEISHU_BOT_WEBHOOK="https://open.feishu.cn/open-apis/bot/v2/hook/your-hook-id"
 FEISHU_VERIFICATION_TOKEN="optional-feishu-event-verification-token"
+# 联网搜索配置（可选）
+# 注册 SerpAPI 获取 API Key: https://serpapi.com/
+SEARCH_API_KEY="your-serpapi-key"
+# 自定义搜索 API 端点（可选，默认使用 SerpAPI）
+# SEARCH_API_ENDPOINT="https://your-custom-search-api.com/search"
